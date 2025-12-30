@@ -289,3 +289,237 @@ All 100 requests now return `{"status":"accepted"}`.
 | Scalability | Limited by single worker | Scales with worker count |
 
 ---
+
+# STEP 7 — Lock Contention (THE HIDDEN PERFORMANCE KILLER)
+
+## The Problem Setup
+
+In Stage 6, we had 4 workers sharing one mutex:
+
+```rust
+type State = Arc<Mutex<HashMap<String, i64>>>;
+```
+
+This worked fine at low scale. But what happens when we increase workers?
+
+## Architecture: The Bottleneck
+
+```
+                    ┌─────────────────────────────────────┐
+                    │     SINGLE MUTEX (State)            │
+                    │   HashMap<String, i64>              │
+                    └─────────────────────────────────────┘
+                                    ▲
+            ┌───────────────────────┼───────────────────────┐
+            │                       │                       │
+      [Worker 0]              [Worker 1]              [Worker 2]
+       waiting...              HOLDING LOCK            waiting...
+            │                       │                       │
+      [Worker 3] ... [Worker 15]    │                       
+       all waiting...               ▼
+                              Updating user5
+```
+
+**The Problem:**
+- Worker 1 locks the mutex to update `user5`
+- Workers 0, 2-15 are **blocked waiting** even though they're updating **different users**
+- CPUs sit idle while workers wait for the lock
+- More workers = more waiting = **worse performance**
+
+---
+
+## The "Hot Lock" Problem
+
+A "hot lock" is a mutex that:
+1. Guards frequently-accessed data
+2. Is held by many threads
+3. Causes most threads to spend time **waiting** rather than **working**
+
+Symptoms:
+- High CPU wait times
+- Low CPU utilization despite many threads
+- Throughput plateaus or decreases with more workers
+
+---
+
+## Why This Scales Badly
+
+| Workers | Expected Throughput | Actual Behavior |
+|---------|---------------------|-----------------|
+| 1 worker | 2 jobs/sec | Works fine, no contention |
+| 4 workers | 8 jobs/sec | OK, some waiting |
+| 16 workers | 32 jobs/sec | Plateaus at ~10-12 jobs/sec |
+| 64 workers | 128 jobs/sec | Actually slower due to overhead |
+
+**The Paradox:** Adding more workers should increase throughput, but with a single lock, it can **decrease** performance.
+
+---
+
+## What We Instrumented
+
+```rust
+// Measure time waiting to acquire lock
+let wait_start = Instant::now();
+let mut state = worker_state.lock().await;
+let wait_duration = wait_start.elapsed();
+
+// Measure time holding the lock
+let hold_start = Instant::now();
+// ... do work ...
+let hold_duration = hold_start.elapsed();
+```
+
+This shows:
+- **Lock wait time:** How long workers blocked waiting for the mutex
+- **Lock hold time:** How long each worker held the lock
+- **Throughput:** Jobs processed per second
+
+---
+
+## Key Learnings
+
+### 1. Locks scale badly if used blindly
+- A single mutex becomes a serialization point
+- All parallelism is lost when everyone waits for one lock
+- More threads can mean worse performance
+
+### 2. Lock contention is invisible without measurement
+- System appears "busy" but throughput is low
+- CPU is actually idle, waiting on locks
+- Must instrument to see the problem
+
+### 3. The contention formula
+```
+Contention Cost = (Number of Workers) × (Lock Hold Time) × (Access Frequency)
+```
+Reduce any factor to reduce contention.
+
+### 4. Work outside the lock
+- Do computation BEFORE acquiring the lock
+- Hold the lock only for the critical section
+- Release immediately after mutation
+
+### 5. Lock granularity matters
+- Coarse-grained: One lock for everything (our problem)
+- Fine-grained: One lock per user (Stage 8 solution)
+- Lock-free: No locks at all (advanced)
+
+---
+
+## Observing Contention
+
+When you run the Stage 7 stress test, watch for:
+
+```
+[Worker  5] user=user3, balance=30, wait=45.23ms, hold=10.12ms
+[Worker 12] user=user7, balance=50, wait=82.45ms, hold=10.08ms
+```
+
+- **High wait times** = workers blocking on the mutex
+- **Consistent hold times** = the lock is always held ~10ms
+- **wait >> hold** = severe contention
+
+---
+
+## The Insight
+
+```
+"Locks scale badly if used blindly."
+```
+
+This means:
+- Don't lock more than you need
+- Don't hold locks longer than necessary
+- Consider sharding or lock-free alternatives
+- Sometimes less concurrency is faster than contention
+
+---
+
+## Preview: Stage 8 (The Solution)
+
+Split the state into **shards** so workers updating different users don't block each other:
+
+```rust
+// Before: ONE lock for all users
+Arc<Mutex<HashMap<String, i64>>>
+
+// After: N locks for N shards
+Vec<Arc<Mutex<HashMap<String, i64>>>>
+
+// Route user to shard by hash
+let shard_idx = hash(user) % num_shards;
+let shard = &shards[shard_idx];
+```
+
+---
+
+## The Bottleneck Formula
+
+```
+Channel fills when:  (Incoming rate) > (Processing rate)
+
+Processing rate = workers × (1 / processing_time)
+                = 16 workers × (1 / 110ms)  ≈ 145 jobs/sec max theoretical
+
+BUT with lock contention (10ms hold × 16 workers competing):
+Actual rate ≈ 1000ms / 10ms_hold = ~100 jobs/sec effective max
+```
+
+The channel capacity is **100 jobs**. Once it fills, new requests get rejected via `try_send()`.
+
+---
+
+## Test Configuration
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| Workers | 16 | Many workers to show contention |
+| Channel capacity | 100 | Bounded queue for backpressure |
+| Lock hold time | 10ms | Simulates work while holding lock |
+| Processing time | 100ms | Simulates async work before lock |
+| Concurrency | 200 | More than channel capacity |
+| Total requests | 5000 | Sustained pressure |
+
+---
+
+## Actual Test Results
+
+```
+=== Stage 7: Lock Contention Stress Test ===
+Total requests: 5000
+Concurrency: 200
+
+=== Results ===
+Duration:     0.39s
+Throughput:   12,937 requests/sec (client sending rate)
+Avg latency:  13.8ms
+
+Accepted:     138
+Rejected:     4862 (backpressure)  ← 97% REJECTED!
+Errors:       0
+```
+
+### Analysis
+
+| Metric | Value | Meaning |
+|--------|-------|---------|
+| **Accepted** | 138 | Only ~138 jobs made it into the queue |
+| **Rejected** | 4862 | 97% of requests rejected due to full queue |
+| **Duration** | 0.39s | Client sent all 5000 requests in under half a second |
+| **Why rejected** | Lock contention | 16 workers serialized on 1 lock, couldn't drain fast enough |
+
+### Why 97% Were Rejected
+
+1. **200 concurrent requests** flooded the channel (capacity: 100)
+2. Each worker holds the lock for **~10ms** while processing
+3. With 16 workers competing for 1 lock, they **serialize** instead of parallelize
+4. **Actual processing rate ≈ 100 jobs/sec** (limited by lock contention)
+5. Queue filled immediately → rejections via backpressure
+
+### The Paradox Proven
+
+> You have **16 workers** but only ~100 jobs/sec throughput because they're all fighting for **one lock**.
+
+Adding more workers **doesn't help** — it actually increases contention overhead!
+
+---
