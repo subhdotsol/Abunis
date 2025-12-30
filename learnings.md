@@ -73,3 +73,102 @@ Throughput is limited by slow processing:
 - Simulates real-world “one slow client delays others” problem
 
 ---
+
+
+# STEP 5 — Introduce bounded async channel (BACKPRESSURE PAIN) 
+
+### **1. Decoupling IO from work**
+
+By separating TCP handling from processing, you learned that user-facing paths must remain fast and predictable.
+
+* Network IO should only **read, validate, and enqueue**
+* Slow operations (sleep, DB writes, state mutation) belong elsewhere
+* Mixing IO and work causes latency spikes and task pile-ups
+
+This separation is the foundation of scalable systems.
+
+---
+
+### **2. Bounded queues define capacity**
+
+The bounded channel forced you to explicitly declare how much work the system can hold.
+
+* Queue size is a **hard capacity limit**, not a tuning hint
+* Memory usage is now predictable
+* Overload becomes visible instead of implicit
+
+Capacity that isn’t explicit will be discovered the hard way.
+
+---
+
+### **3. Backpressure is honesty**
+
+When the queue fills and `try_send` fails, the system refuses new work immediately.
+
+* Clients get fast, clear rejection
+* Latency stays bounded
+* The server remains responsive
+
+Backpressure shifts pain outward instead of letting it destroy the system internally.
+
+---
+
+### **4. Dropping work is sometimes correct**
+
+Rejecting requests under load feels wrong, but it protects the system.
+
+* Not all data is equally valuable
+* Uptime is often more important than completeness
+* Graceful loss beats catastrophic failure
+
+Stable systems choose *which* failures they are willing to accept.
+
+---
+
+### **5. Queues smooth bursts, not overload**
+
+The worker speed never changed, even under heavy load.
+
+* Throughput is fixed by processing capacity
+* Queues only absorb short spikes
+* Sustained overload must result in rejection
+
+This clarifies the difference between **latency control** and **capacity creation**.
+
+---
+
+### **6. Fail fast vs block is a policy decision**
+
+Choosing `try_send` over `send().await` made overload explicit.
+
+* Blocking hides pressure and spreads it through the system
+* Failing fast keeps behavior predictable
+* Clear rejection is easier to reason about than silent slowdown
+
+Blocking is often just delayed failure.
+
+---
+
+### **7. Serialization can be a strength**
+
+Using a single worker simplified correctness.
+
+* One consumer means ordered processing
+* State mutation is safe and understandable
+* Throughput limits are intentional, not accidental
+
+Concurrency is not always the right answer.
+
+---
+
+### **8. Stress testing reveals truth**
+
+The client confirmed the system behaved as designed.
+
+* Accepted requests matched queue capacity
+* Rejections increased under load
+* No crashes or undefined behavior
+
+A system that fails *predictably* is a system you can trust.
+
+---
