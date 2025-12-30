@@ -1,175 +1,433 @@
-# STAGE 1 :  Why the Server Freezes and How to Prove It
+# STAGE 1 — Blocking Single-Threaded Server (THE FREEZE)
 
+## The Problem
 
-Your server waits for the client to finish sending a complete HTTP request before it responds. If a client connects but sends nothing or sends only part of the request, the server blocks and waits forever. Because the server is single-threaded and uses blocking I/O, it can only handle one connection at a time, so while it is waiting on one client, all other clients are ignored.
+A single-threaded, blocking server can only handle **one connection at a time**. If a client connects but doesn't send data, the server **freezes** waiting for that one client.
 
-This means a single slow or misbehaving client can freeze the entire server. When multiple clients connect, the first one that blocks prevents the server from accepting or responding to any others. This behavior is not a Rust bug or a TCP issue — it is a design limitation of a blocking, single-threaded server and explains why real servers rely on threads, async I/O, or timeouts.
+## Architecture
 
-You tested this behavior using these steps:
+```
+[Client 1] ──────┐
+                 │
+[Client 2] ──────┼───▶ [Server] ──▶ Blocked waiting for Client 1
+                 │        │
+[Client 3] ──────┘        ▼
+                    (all ignored)
+```
 
-1. Start the server with `cargo run`.
-2. Open many connections at once using `for i in {1..20}; do nc 127.0.0.1 8080 & done`, without sending any data.
-3. Observe that the server accepts only one connection and then freezes, while all clients receive no response.
-4. Try sending a valid HTTP request from another terminal and see that it also hangs, proving that one slow client can block the entire server.
+**What happens:**
+1. Client 1 connects but sends nothing
+2. Server blocks on `read()` waiting for Client 1's data
+3. Clients 2, 3 connect but server is stuck — can't accept them
+4. **Entire server is frozen** by one slow client
 
----
+## Code Pattern (The Problem)
 
-# Stage 2 : Why the async server is better than the old blocking server
+```rust
+// Blocking, single-threaded server
+loop {
+    let (stream, addr) = listener.accept()?;  // Block until connection
+    handle_client(stream)?;                    // Block until complete
+    // ❌ Can't accept new clients while handling this one!
+}
+```
 
-1. Handles multiple clients at once – each client runs in its own async task, so slow clients don’t block others.
-2. Efficient waiting – uses async I/O, so one thread can handle many connections without sitting idle.
-3. Independent clients – you can run multiple client programs (client.rs) simultaneously.
-4. Scalable – can handle dozens or hundreds of clients without creating a thread per client.
-5. Same functionality – still echoes the request body back correctly, just now concurrently.
+## How to Test
 
----
+```bash
+# Terminal 1: Start server
+cargo run
 
-# Stage 3 — Parse events (introduce correctness)
+# Terminal 2: Open 20 connections that send nothing
+for i in {1..20}; do nc 127.0.0.1 8080 & done
 
-In Stage 3, the server moves from blindly handling bytes to enforcing correctness at the boundary. By fully reading request bodies, parsing JSON into a typed `Event`, and rejecting invalid input in a controlled way, the system becomes resilient to malformed, partial, or unexpected data. This stage proves that real-world clients cannot be trusted, that partial reads are normal, and that correctness must be designed explicitly rather than assumed. Establishing clear validation and error handling here creates a reliable contract on which all later stages—state management, concurrency, and performance—depend.
+# Result: Server accepts ONE connection, then freezes
+```
 
-**Key learnings (points):**
+## Key Learnings
 
-* Real users and clients send malformed, incomplete, or garbage data.
-* Network reads are partial by default; full bodies must be assembled before parsing.
-* Parsing into a typed structure is both validation and documentation of the protocol.
-* Errors should be handled explicitly and return predictable responses, not crashes.
-* Async I/O improves waiting efficiency but does not guarantee correctness.
-* Correctness at the boundary is the foundation for all future scalability and performance work.
+### 1. Blocking I/O serializes everything
+- `read()` blocks until data arrives
+- One slow client = entire server blocked
+- No way to handle multiple clients
 
----
-# STEP 4 — Single-threaded processing (INTENTIONALLY SLOW)
+### 2. Single-threaded = single point of failure
+- One misbehaving client can DoS the server
+- No timeout = infinite wait
+- Real servers need concurrency
 
-What we did
-- Parsed JSON into Event (like STEP 3)
-- Introduced shared in-memory state:
-- HashMap<String, i64> to store user balances
-- Wrapped in Arc<Mutex<...>> for safe async access
-- Updated state in the request handler:
-- Added the event amount to the user’s balance
-
-Added intentionally slow processing:
-- sleep(Duration::from_millis(500)).await simulates heavy work
-- Fixed async correctness:
-- Used tokio::sync::Mutex instead of futures mutex
-- Used tokio::time::sleep instead of blocking std::thread::sleep
-
-## Key learnings
-
-Async does not equal parallel:
-- Multiple clients are accepted concurrently
-- Slow work + mutex serializes requests
-
-Shared state must be locked:
-- Prevents race conditions
-- Ensures balances are correct
-
-Correctness from STEP 3 is preserved:
-- Invalid/malformed JSON is rejected
-- Server never crashes
-
-Throughput is limited by slow processing:
-- Single-threaded work is a bottleneck
-- Simulates real-world “one slow client delays others” problem
+### 3. This is a design limitation, not a bug
+- Not a Rust issue, not a TCP issue
+- Blocking + single-threaded = frozen server
+- Fix requires threads, async, or timeouts
 
 ---
 
+# STAGE 2 — Async Tokio Server (CONCURRENCY)
 
-# STEP 5 — Introduce bounded async channel (BACKPRESSURE PAIN) 
+## The Solution
 
-### **1. Decoupling IO from work**
+Replace blocking I/O with **async/await** using Tokio. Each connection runs in its own async task, so slow clients don't block others.
 
-By separating TCP handling from processing, you learned that user-facing paths must remain fast and predictable.
+## Architecture: Before vs After
 
-* Network IO should only **read, validate, and enqueue**
-* Slow operations (sleep, DB writes, state mutation) belong elsewhere
-* Mixing IO and work causes latency spikes and task pile-ups
+### Before (Stage 1 - Blocking)
+```
+[Client 1] ────▶ [Server] ◀──── blocked
+[Client 2] ────▶   (waiting)
+[Client 3] ────▶   (waiting)
+```
 
-This separation is the foundation of scalable systems.
+### After (Stage 2 - Async)
+```
+[Client 1] ────▶ [Task 1] ─┐
+[Client 2] ────▶ [Task 2] ─┼──▶ [Tokio Runtime] ──▶ [Single Thread]
+[Client 3] ────▶ [Task 3] ─┘         │
+                                     ▼
+                           (handles all concurrently)
+```
 
----
+## Code Pattern (The Fix)
 
-### **2. Bounded queues define capacity**
+```rust
+// Async, concurrent server
+loop {
+    let (stream, addr) = listener.accept().await?;  // Non-blocking
+    
+    tokio::spawn(async move {                        // Spawn task
+        handle_client(stream).await?;                // Runs concurrently
+    });
+    // ✅ Immediately ready to accept next client!
+}
+```
 
-The bounded channel forced you to explicitly declare how much work the system can hold.
+## Key Learnings
 
-* Queue size is a **hard capacity limit**, not a tuning hint
-* Memory usage is now predictable
-* Overload becomes visible instead of implicit
+### 1. Async enables concurrency on one thread
+- `await` yields control, doesn't block
+- Runtime switches between tasks efficiently
+- Thousands of connections, one thread
 
-Capacity that isn’t explicit will be discovered the hard way.
+### 2. Each client is independent
+- Slow Client 1 doesn't affect Client 2
+- Tasks run concurrently, not sequentially
+- No more server freezing
 
----
+### 3. Same functionality, better scalability
+- Still echoes request body correctly
+- Now handles dozens/hundreds of clients
+- No thread-per-connection overhead
 
-### **3. Backpressure is honesty**
-
-When the queue fills and `try_send` fails, the system refuses new work immediately.
-
-* Clients get fast, clear rejection
-* Latency stays bounded
-* The server remains responsive
-
-Backpressure shifts pain outward instead of letting it destroy the system internally.
-
----
-
-### **4. Dropping work is sometimes correct**
-
-Rejecting requests under load feels wrong, but it protects the system.
-
-* Not all data is equally valuable
-* Uptime is often more important than completeness
-* Graceful loss beats catastrophic failure
-
-Stable systems choose *which* failures they are willing to accept.
-
----
-
-### **5. Queues smooth bursts, not overload**
-
-The worker speed never changed, even under heavy load.
-
-* Throughput is fixed by processing capacity
-* Queues only absorb short spikes
-* Sustained overload must result in rejection
-
-This clarifies the difference between **latency control** and **capacity creation**.
-
----
-
-### **6. Fail fast vs block is a policy decision**
-
-Choosing `try_send` over `send().await` made overload explicit.
-
-* Blocking hides pressure and spreads it through the system
-* Failing fast keeps behavior predictable
-* Clear rejection is easier to reason about than silent slowdown
-
-Blocking is often just delayed failure.
+### 4. Async ≠ Parallel
+- Concurrency: multiple tasks making progress
+- Parallelism: multiple tasks at the exact same time
+- Async is concurrent but single-threaded
 
 ---
 
-### **7. Serialization can be a strength**
+# STAGE 3 — JSON Parsing & Validation (CORRECTNESS)
 
-Using a single worker simplified correctness.
+## The Problem
 
-* One consumer means ordered processing
-* State mutation is safe and understandable
-* Throughput limits are intentional, not accidental
+Real clients send **garbage**. Malformed JSON, incomplete requests, unexpected data types. If the server crashes on bad input, it's not production-ready.
 
-Concurrency is not always the right answer.
+## Architecture
+
+```
+[Raw Bytes] ──▶ [HTTP Parser] ──▶ [JSON Parser] ──▶ [Typed Event]
+     │               │                  │                │
+     ▼               ▼                  ▼                ▼
+ "garbage"      invalid HTTP      invalid JSON      Event struct
+     │               │                  │                │
+     └───────────────┴──────────────────┴────────────────┘
+                               │
+                               ▼
+                    { "status": "error", "reason": "..." }
+```
+
+## The Event Type
+
+```rust
+#[derive(Debug, Deserialize)]
+struct Event {
+    user: String,
+    action: String,
+    amount: i64,
+}
+
+// Valid: {"user": "alice", "action": "buy", "amount": 100}
+// Invalid: {"foo": "bar"}
+// Invalid: "not json at all"
+// Invalid: (empty body)
+```
+
+## Code Pattern
+
+```rust
+// Parse and validate
+match serde_json::from_slice::<Event>(&body) {
+    Ok(event) => {
+        // ✅ Valid event, process it
+        r#"{"status":"accepted"}"#
+    }
+    Err(_) => {
+        // ❌ Invalid input, reject gracefully
+        r#"{"status":"error","reason":"invalid_json"}"#
+    }
+}
+```
+
+## Content-Length Parsing
+
+```rust
+// HTTP header parsing (case-insensitive!)
+let line_lower = line.to_lowercase();
+if let Some(len) = line_lower.strip_prefix("content-length: ") {
+    content_length = len.trim().parse::<usize>().unwrap_or(0);
+}
+
+// Read exact body length
+let mut body = vec![0; content_length];
+reader.read_exact(&mut body).await?;
+```
+
+## Key Learnings
+
+### 1. Never trust client input
+- Clients send garbage, malformed data, attacks
+- Validate everything at the boundary
+- Reject invalid input gracefully
+
+### 2. Typed parsing is both validation and documentation
+```rust
+// This IS the protocol contract:
+struct Event { user: String, action: String, amount: i64 }
+```
+
+### 3. Network reads are partial
+- TCP doesn't guarantee complete messages
+- Must read `Content-Length` bytes exactly
+- Partial reads are normal, not errors
+
+### 4. Errors should be predictable
+- Never crash on bad input
+- Return structured error responses
+- Clients can handle rejections gracefully
+
+### 5. Correctness enables everything else
+- Can't scale a broken system
+- Validation is the foundation
+- Build performance on top of correctness
 
 ---
 
-### **8. Stress testing reveals truth**
+# STAGE 4 — Shared State & Slow Processing (LATENCY PAIN)
 
-The client confirmed the system behaved as designed.
+## The Problem
 
-* Accepted requests matched queue capacity
-* Rejections increased under load
-* No crashes or undefined behavior
+Real servers have **state** (databases, caches, user sessions). Real work takes **time** (API calls, computation). How does async handle slow operations with shared state?
 
-A system that fails *predictably* is a system you can trust.
+## Architecture
+
+```
+[Client 1] ──▶ [Accept] ──▶ [Parse] ──▶ [Lock State] ──▶ [Update] ──▶ [Response]
+                                              │            500ms
+                                              ▼
+[Client 2] ──▶ [Accept] ──▶ [Parse] ──▶ [WAITING...] 
+                                              │
+                                              ▼
+                                    (blocked on mutex)
+```
+
+## State Management
+
+```rust
+// Shared state: user → balance
+type State = Arc<Mutex<HashMap<String, i64>>>;
+
+// Usage in handler
+let mut state = state.lock().await;
+let balance = state.entry(event.user).or_insert(0);
+*balance += event.amount;
+```
+
+## Simulating Slow Work
+
+```rust
+// ❌ WRONG: Blocking sleep (blocks entire runtime!)
+std::thread::sleep(Duration::from_millis(500));
+
+// ✅ CORRECT: Async sleep (yields to runtime)
+tokio::time::sleep(Duration::from_millis(500)).await;
+```
+
+## Tokio vs Std Mutex
+
+```rust
+// ❌ std::sync::Mutex - blocks the OS thread
+let mut state = state.lock().unwrap();
+
+// ✅ tokio::sync::Mutex - yields to async runtime
+let mut state = state.lock().await;
+```
+
+## Key Learnings
+
+### 1. Async does not equal parallel
+- Multiple clients accepted concurrently
+- But slow work + mutex = serialization
+- Requests queue up behind the lock
+
+### 2. Use async-aware primitives
+| Need | Wrong | Right |
+|------|-------|-------|
+| Sleep | `std::thread::sleep` | `tokio::time::sleep` |
+| Mutex | `std::sync::Mutex` | `tokio::sync::Mutex` |
+| Channel | `std::sync::mpsc` | `tokio::sync::mpsc` |
+
+### 3. Shared state requires locking
+- Prevents data races
+- Ensures correct balances
+- But introduces serialization
+
+### 4. Throughput is limited by slow work
+- 500ms processing = 2 requests/sec max
+- Mutex makes it worse (serialization)
+- Single-threaded processing is a bottleneck
+
+### 5. This sets up the need for workers
+- Can't just "go faster" in the handler
+- Need to decouple IO from processing
+- Stage 5 introduces the solution
+
+---
+
+# STAGE 5 — Bounded Channels & Backpressure (CAPACITY LIMITS)
+
+## The Problem
+
+In Stage 4, slow processing blocked the IO path. If 1000 requests arrive but we can only process 2/sec, what happens? Memory grows, latency spikes, eventually the server dies.
+
+## The Solution
+
+**Decouple IO from work** using an async channel:
+- TCP handler: accept, parse, enqueue (fast)
+- Worker: dequeue, process, update state (slow)
+
+## Architecture
+
+```
+[Clients] ──▶ [TCP Handlers] ──▶ [Bounded Channel (100)] ──▶ [Worker] ──▶ [State]
+                   │                      │                      │
+              (fast path)           (capacity limit)        (slow path)
+                   │                      │                      │
+              ~1000 req/sec          max 100 jobs           2 jobs/sec
+                   │                      │
+                   ▼                      ▼
+              "accepted"           "rejected" (if full)
+```
+
+## The Bounded Channel
+
+```rust
+// Create channel with capacity 100
+let (tx, rx) = mpsc::channel::<Job>(100);
+
+// In TCP handler: non-blocking send
+match tx.try_send(Job { event }) {
+    Ok(_) => r#"{"status":"accepted"}"#,           // Enqueued
+    Err(_) => r#"{"status":"rejected","reason":"server_busy"}"#, // Queue full
+}
+```
+
+## try_send vs send
+
+```rust
+// try_send: Fail immediately if queue is full
+tx.try_send(job)?;  // ✅ Returns immediately, fast path stays fast
+
+// send().await: Block until space available
+tx.send(job).await?;  // ❌ Slow consumer blocks fast producer
+```
+
+## The Worker Loop
+
+```rust
+// Single worker processing jobs
+loop {
+    if let Some(job) = rx.recv().await {
+        // Slow processing (500ms)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        
+        // Update state
+        let mut state = state.lock().await;
+        *state.entry(job.event.user).or_insert(0) += job.event.amount;
+    }
+}
+```
+
+## Key Learnings
+
+### 1. Decouple IO from work
+- TCP handlers should be fast: read, validate, enqueue
+- Slow work belongs in dedicated workers
+- Mixing IO and work causes latency spikes
+
+### 2. Bounded queues define capacity
+- Queue size is a hard limit, not a hint
+- Memory usage is predictable
+- Overload becomes visible immediately
+
+### 3. Backpressure is honesty
+- When queue fills, reject new work
+- Clients get fast, clear feedback
+- Latency stays bounded
+- Server remains responsive
+
+### 4. Dropping work is sometimes correct
+- Rejecting requests under load is protection
+- Uptime > completeness
+- Graceful degradation beats catastrophic failure
+
+### 5. Queues smooth bursts, not overload
+- Queues absorb short traffic spikes
+- Sustained overload → rejections
+- Throughput is fixed by worker capacity
+
+### 6. Fail fast vs block is a policy choice
+| Strategy | Behavior | Best For |
+|----------|----------|----------|
+| `try_send` | Reject immediately | User-facing APIs |
+| `send().await` | Block until space | Internal pipelines |
+
+### 7. Serialization can be a strength
+- Single worker = ordered processing
+- No race conditions on state
+- Simple to reason about
+
+### 8. Stress testing reveals truth
+- Run more clients than capacity
+- Verify: accepted ≈ capacity, rejected = overflow
+- A system that fails predictably is trustworthy
+
+## Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Channel capacity | 100 |
+| Worker count | 1 |
+| Processing time | 500ms |
+| Expected throughput | 2 jobs/sec |
+
+## Summary: Stages 1-5 Progression
+
+| Stage | Problem | Solution | Throughput |
+|-------|---------|----------|------------|
+| 1 | Blocking freezes server | — | 1 client at a time |
+| 2 | One thread for all | Async tasks | Many concurrent |
+| 3 | Bad input crashes server | JSON validation | Same, but correct |
+| 4 | Slow work blocks IO | — | ~2 req/sec |
+| 5 | Unbounded memory growth | Bounded channel + backpressure | ~2 req/sec, predictable |
 
 ---
 
