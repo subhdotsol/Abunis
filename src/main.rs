@@ -1,52 +1,66 @@
-use std::{
-    io::{BufRead, BufReader, Read, Write},
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
+#[tokio::main]
+async fn main() -> tokio::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+    println!("Server listening on 127.0.0.1:8080");
 
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
-        println!("Accepted connection");
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        println!("Accepted connection from {}", addr);
 
-        handle_connection(stream);
-
-        println!("Connection established");
+        // Spawn a new async task to handle the connection concurrently
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream).await {
+                eprintln!("Error handling connection: {:?}", e);
+            }
+        });
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut reader = BufReader::new(&stream);
+async fn handle_connection(mut stream: TcpStream) -> tokio::io::Result<()> {
+    let mut reader = BufReader::new(&mut stream);
 
     let mut content_length = 0;
-    // let mut content_length = 0;
+
+    // Read HTTP headers
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        let bytes_read = reader.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            // Connection closed
+            return Ok(());
+        }
+
         let line = line.trim();
         if line.is_empty() {
             break;
         }
+
         if let Some(len) = line.strip_prefix("Content-Length: ") {
-            // content_length = len.parse().unwrap();
-            content_length = len.parse::<usize>().unwrap();
+            content_length = len.parse::<usize>().unwrap_or(0);
         }
     }
 
-    // read request body
+    // Read the request body
     let mut body = vec![0; content_length];
-    reader.read_exact(&mut body).unwrap();
+    reader.read_exact(&mut body).await?;
 
-    // echo the body back to the client
+    // Echo the body back
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
-            Content-Type: application/json\r\n\
-            Content-Length: {}\r\n\
-            \r\n",
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n",
         body.len()
     );
-    stream.write_all(response.as_bytes()).unwrap();
-    stream.write_all(&body).unwrap();
-    stream.flush().unwrap();
+
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+
+    Ok(())
 }
