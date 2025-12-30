@@ -24,3 +24,17 @@ You tested this behavior using these steps:
 
 ---
 
+# Stage 3 — Parse events (introduce correctness)
+
+In Stage 3, the server moves from blindly handling bytes to enforcing correctness at the boundary. By fully reading request bodies, parsing JSON into a typed `Event`, and rejecting invalid input in a controlled way, the system becomes resilient to malformed, partial, or unexpected data. This stage proves that real-world clients cannot be trusted, that partial reads are normal, and that correctness must be designed explicitly rather than assumed. Establishing clear validation and error handling here creates a reliable contract on which all later stages—state management, concurrency, and performance—depend.
+
+**Key learnings (points):**
+
+* Real users and clients send malformed, incomplete, or garbage data.
+* Network reads are partial by default; full bodies must be assembled before parsing.
+* Parsing into a typed structure is both validation and documentation of the protocol.
+* Errors should be handled explicitly and return predictable responses, not crashes.
+* Async I/O improves waiting efficiency but does not guarantee correctness.
+* Correctness at the boundary is the foundation for all future scalability and performance work.
+
+---
