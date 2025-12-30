@@ -38,3 +38,38 @@ In Stage 3, the server moves from blindly handling bytes to enforcing correctnes
 * Correctness at the boundary is the foundation for all future scalability and performance work.
 
 ---
+# STEP 4 — Single-threaded processing (INTENTIONALLY SLOW)
+
+What we did
+- Parsed JSON into Event (like STEP 3)
+- Introduced shared in-memory state:
+- HashMap<String, i64> to store user balances
+- Wrapped in Arc<Mutex<...>> for safe async access
+- Updated state in the request handler:
+- Added the event amount to the user’s balance
+
+Added intentionally slow processing:
+- sleep(Duration::from_millis(500)).await simulates heavy work
+- Fixed async correctness:
+- Used tokio::sync::Mutex instead of futures mutex
+- Used tokio::time::sleep instead of blocking std::thread::sleep
+
+## Key learnings
+
+Async does not equal parallel:
+- Multiple clients are accepted concurrently
+- Slow work + mutex serializes requests
+
+Shared state must be locked:
+- Prevents race conditions
+- Ensures balances are correct
+
+Correctness from STEP 3 is preserved:
+- Invalid/malformed JSON is rejected
+- Server never crashes
+
+Throughput is limited by slow processing:
+- Single-threaded work is a bottleneck
+- Simulates real-world “one slow client delays others” problem
+
+---

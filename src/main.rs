@@ -1,7 +1,11 @@
+use std::{collections::HashMap, sync::Arc};
+
 use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::Mutex,
+    time::{Duration, sleep},
 };
 
 #[derive(Debug, Deserialize)]
@@ -11,25 +15,31 @@ struct Event {
     amount: i64,
 }
 
+type State = Arc<Mutex<HashMap<String, i64>>>;
+
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
     println!("Server listening on 127.0.0.1:8080");
 
+    let state = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         let (stream, addr) = listener.accept().await?;
         println!("Accepted connection from {}", addr);
 
+        let state = state.clone();
+
         // Spawn a new async task to handle the connection concurrently
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
+            if let Err(e) = handle_connection(stream, state).await {
                 eprintln!("Error handling connection: {:?}", e);
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream) -> tokio::io::Result<()> {
+async fn handle_connection(mut stream: TcpStream, state: State) -> tokio::io::Result<()> {
     let mut reader = BufReader::new(&mut stream);
 
     let mut content_length = 0;
@@ -60,8 +70,14 @@ async fn handle_connection(mut stream: TcpStream) -> tokio::io::Result<()> {
     // parse the json
     let response_body = match serde_json::from_slice::<Event>(&body) {
         Ok(event) => {
-            println!("Parsed event: {:?}", event);
-            r#"{"status":"accepted"}"#.to_string()
+            // ---- INTENTIONALLY SLOW PROCESSING ----
+            sleep(Duration::from_millis(500)).await;
+
+            let mut state = state.lock().await;
+
+            let balance = state.entry(event.user).or_insert(0);
+            *balance += event.amount;
+            format!(r#"{{"status":"ok","balance":{}}}"#, *balance)
         }
         Err(_) => r#"{"status":"error","reason":"invalid_json"}"#.to_string(),
     };
