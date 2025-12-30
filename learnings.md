@@ -172,3 +172,120 @@ The client confirmed the system behaved as designed.
 A system that fails *predictably* is a system you can trust.
 
 ---
+
+# STEP 6 — Multi-Worker Pool with Shared Receiver (PARALLELISM + REAL-WORLD BUGS)
+
+## What we built
+
+- **Multiple worker threads** (4 workers) each running their own Tokio runtime
+- **Shared channel receiver** wrapped in `Arc<Mutex<Receiver<Job>>>` so all workers can pull from the same queue
+- Jobs are distributed automatically — whichever worker is free grabs the next job
+
+## Architecture: Before vs After
+
+### Before (Stage 5 - Single Worker)
+```
+[Clients] → [TCP Handler] → [Bounded Channel (100)] → [Single Worker] → [State]
+                                                            ↓
+                                              Processing: ~500ms per job
+                                              Throughput: ~2 jobs/sec
+```
+
+### After (Stage 6 - Multi-Worker)
+```
+[Clients] → [TCP Handler] → [Bounded Channel (100)] → [Shared Receiver]
+                                                            ↓
+                                    ┌───────────────────────┼───────────────────────┐
+                                    ↓                       ↓                       ↓
+                              [Worker 0]              [Worker 1]              [Worker 2] ...
+                                    ↓                       ↓                       ↓
+                                    └───────────────────────┼───────────────────────┘
+                                                            ↓
+                                                        [State]
+                                              Processing: ~500ms per job
+                                              Throughput: ~8 jobs/sec (4x faster)
+```
+
+---
+
+## The Bug We Hit: HTTP Headers Are Case-Insensitive
+
+### The Problem
+All 100 requests returned `{"status":"error","reason":"invalid_json"}` even though the JSON was perfectly valid.
+
+### Root Cause
+Our server parsed the `Content-Length` header like this:
+```rust
+// ❌ WRONG - Case-sensitive matching
+if let Some(len) = line.strip_prefix("Content-Length: ") {
+    content_length = len.parse::<usize>().unwrap_or(0);
+}
+```
+
+But the `reqwest` HTTP client (and many others) sends headers in **lowercase**:
+```
+content-length: 43
+```
+
+Per **RFC 7230**, HTTP headers are **case-insensitive**. Our code only matched `Content-Length:` exactly, so when `reqwest` sent `content-length:`, the content length stayed `0`. This caused us to read an empty body, which failed JSON parsing.
+
+### The Fix
+```rust
+// ✅ CORRECT - Case-insensitive matching
+let line_lower = line.to_lowercase();
+if let Some(len) = line_lower.strip_prefix("content-length: ") {
+    content_length = len.trim().parse::<usize>().unwrap_or(0);
+}
+```
+
+### Result After Fix
+All 100 requests now return `{"status":"accepted"}`.
+
+---
+
+## Key Learnings
+
+### 1. HTTP headers are case-insensitive (RFC 7230)
+- `Content-Length`, `content-length`, `CONTENT-LENGTH` are all valid
+- Different HTTP libraries use different conventions
+- `curl` sends `Content-Length`, `reqwest` sends `content-length`
+- Always normalize case before comparing headers
+
+### 2. Multi-worker pools multiply throughput
+- 4 workers = ~4x throughput (with 500ms processing time)
+- Workers compete for jobs from a shared queue
+- Load is automatically balanced — idle workers grab work
+
+### 3. Shared receiver pattern
+- Wrap the receiver in `Arc<Mutex<Receiver<Job>>>`
+- Each worker locks the mutex, receives a job, then unlocks
+- Simple and effective for work distribution
+
+### 4. Thread per worker with dedicated runtime
+- Each worker runs in a separate OS thread
+- Each thread has its own Tokio runtime
+- Prevents one slow worker from blocking others
+
+### 5. Debugging network protocols requires visibility
+- The error message `invalid_json` was misleading
+- The actual issue was header parsing, not JSON
+- Tracing the full request path revealed the truth
+
+### 6. Test with real HTTP clients
+- `curl` worked fine (sends proper-cased headers)
+- `reqwest` exposed the bug (sends lowercase headers)
+- Always test with multiple clients to catch edge cases
+
+---
+
+## Summary Table
+
+| Aspect | Before (Single Worker) | After (Multi-Worker) |
+|--------|------------------------|----------------------|
+| Workers | 1 | 4 |
+| Throughput | ~2 jobs/sec | ~8 jobs/sec |
+| Header parsing | Case-sensitive (bug) | Case-insensitive (correct) |
+| Job distribution | Sequential | Parallel, load-balanced |
+| Scalability | Limited by single worker | Scales with worker count |
+
+---
