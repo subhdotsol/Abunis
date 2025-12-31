@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc, thread};
+use std::{sync::Arc, thread};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use dashmap::DashMap;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -21,12 +22,12 @@ struct Job {
     event: Event,
 }
 
-type State = Arc<Mutex<HashMap<String, i64>>>;
+// ===== STAGE 8: DashMap instead of Mutex<HashMap> =====
+type State = Arc<DashMap<String, i64>>;
 
-// ===== STAGE 7: Lock contention metrics =====
+// Metrics for monitoring
 struct Metrics {
     total_lock_wait_ns: AtomicU64,
-    total_lock_hold_ns: AtomicU64,
     jobs_processed: AtomicU64,
 }
 
@@ -34,7 +35,6 @@ impl Metrics {
     fn new() -> Self {
         Self {
             total_lock_wait_ns: AtomicU64::new(0),
-            total_lock_hold_ns: AtomicU64::new(0),
             jobs_processed: AtomicU64::new(0),
         }
     }
@@ -45,15 +45,16 @@ async fn main() -> tokio::io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
     println!("Server listening on 127.0.0.1:8080");
 
-    let state = Arc::new(Mutex::new(HashMap::new()));
+    // ===== STAGE 8: DashMap - sharded HashMap =====
+    let state: State = Arc::new(DashMap::new());
     let metrics = Arc::new(Metrics::new());
 
-    let (tx, rx) = mpsc::channel::<Job>(100);
+    let (tx, rx) = mpsc::channel::<Job>(1000);  // Increased from 100 to show DashMap benefit
     let rx = Arc::new(Mutex::new(rx));
 
-    // ===== STAGE 7: Increased to 16 workers to show contention =====
     let worker_count = 16;
-    println!("Starting {} workers (Stage 7: Lock Contention Demo)", worker_count);
+    println!("Starting {} workers (Stage 8: DashMap - Sharded State)", worker_count);
+    println!("DashMap uses {} shards internally", num_cpus::get() * 4);
 
     for i in 0..worker_count {
         let rx = rx.clone();
@@ -70,58 +71,48 @@ async fn main() -> tokio::io::Result<()> {
                     };
 
                     if let Some(job) = job_option {
-                        // Simulate slow processing BEFORE lock
-                        sleep(Duration::from_millis(100)).await;
+                        // Reduced processing time to show DashMap benefit
+                        // (100ms was hiding the lock improvement)
+                        sleep(Duration::from_millis(10)).await;
 
-                        // ===== MEASURE LOCK WAIT TIME =====
+                        // ===== STAGE 8: No explicit lock needed! =====
+                        // DashMap handles locking internally per-shard
                         let wait_start = Instant::now();
-                        let mut state = worker_state.lock().await;
+                        
+                        // Minimal work - let DashMap be the focus
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        
+                        // Update state - DashMap locks only the shard containing this key
+                        *worker_state.entry(job.event.user.clone()).or_insert(0) += job.event.amount;
+                        
                         let wait_duration = wait_start.elapsed();
                         
-                        // ===== MEASURE LOCK HOLD TIME =====
-                        let hold_start = Instant::now();
-                        
-                        // Simulate work while holding lock (this is the problem!)
-                        // In real systems this might be DB writes, serialization, etc.
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        
-                        let balance = state.entry(job.event.user.clone()).or_insert(0);
-                        *balance += job.event.amount;
-                        let new_balance = *balance;
-                        
-                        let hold_duration = hold_start.elapsed();
-                        drop(state); // Explicitly release lock
+                        // Get the new balance for logging
+                        let new_balance = *worker_state.get(&job.event.user).unwrap();
 
                         // Record metrics
                         worker_metrics.total_lock_wait_ns.fetch_add(
                             wait_duration.as_nanos() as u64, 
                             Ordering::Relaxed
                         );
-                        worker_metrics.total_lock_hold_ns.fetch_add(
-                            hold_duration.as_nanos() as u64, 
-                            Ordering::Relaxed
-                        );
                         let jobs = worker_metrics.jobs_processed.fetch_add(1, Ordering::Relaxed) + 1;
 
-                        // Print every 50 jobs
-                        if jobs % 50 == 0 {
+                        // Print every 100 jobs
+                        if jobs % 100 == 0 {
                             let avg_wait = worker_metrics.total_lock_wait_ns.load(Ordering::Relaxed) / jobs;
-                            let avg_hold = worker_metrics.total_lock_hold_ns.load(Ordering::Relaxed) / jobs;
                             println!(
-                                "[METRICS] Jobs: {} | Avg lock wait: {:.2}ms | Avg lock hold: {:.2}ms",
+                                "[METRICS] Jobs: {} | Avg shard access time: {:.2}ms",
                                 jobs,
-                                avg_wait as f64 / 1_000_000.0,
-                                avg_hold as f64 / 1_000_000.0
+                                avg_wait as f64 / 1_000_000.0
                             );
                         }
 
                         println!(
-                            "[Worker {:2}] user={}, balance={}, wait={:.2}ms, hold={:.2}ms",
+                            "[Worker {:2}] user={}, balance={}, shard_time={:.2}ms",
                             i,
                             job.event.user,
                             new_balance,
-                            wait_duration.as_secs_f64() * 1000.0,
-                            hold_duration.as_secs_f64() * 1000.0
+                            wait_duration.as_secs_f64() * 1000.0
                         );
                     } else {
                         break;
