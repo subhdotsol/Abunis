@@ -1190,3 +1190,504 @@ Examples:
 > **The goal isn't to accept everything — it's to accept what you can actually process in reasonable time.**
 
 ---
+
+# STAGE 9 — Lock-Free Metrics (PERFORMANCE TRUTH)
+
+## The Problem
+
+You want to track metrics like:
+- **received:** How many requests came in
+- **processed:** How many were successfully processed  
+- **dropped:** How many were rejected (backpressure)
+
+But WHERE do you store these counters?
+
+---
+
+## The Naive Approach (Don't Do This)
+
+```rust
+// Wrap counters in Mutex
+struct Metrics {
+    received: Mutex<u64>,
+    processed: Mutex<u64>,
+    dropped: Mutex<u64>,
+}
+
+// Every request:
+let mut received = metrics.received.lock().await;  // LOCK!
+*received += 1;
+```
+
+**Problem:** Every single request needs to acquire a lock just to increment a counter. With 10,000 req/sec, that's 10,000 lock operations per second — for a simple `+= 1`!
+
+---
+
+## The Solution: Atomics
+
+**Atomics** are special CPU instructions that can update a value **without locks**:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct Metrics {
+    received: AtomicU64,     // No Mutex needed!
+    processed: AtomicU64,
+    dropped: AtomicU64,
+}
+
+// Every request (lock-free!):
+metrics.received.fetch_add(1, Ordering::Relaxed);  // No lock!
+```
+
+---
+
+## How Atomics Work
+
+### Regular Variable (Unsafe — Data Race!)
+```
+Thread 1: read counter (100)
+Thread 2: read counter (100)
+Thread 1: write counter + 1 (101)
+Thread 2: write counter + 1 (101)  ← WRONG! Should be 102
+```
+
+### Mutex (Safe but Slow)
+```
+Thread 1: lock → read (100) → write (101) → unlock
+Thread 2: WAIT... → lock → read (101) → write (102) → unlock
+```
+
+### Atomic (Safe AND Fast)
+```
+Thread 1: atomic_add(1) → CPU does read+increment+write in ONE operation
+Thread 2: atomic_add(1) → CPU does read+increment+write in ONE operation
+Result: 102 ✓ (CPU guarantees correctness)
+```
+
+The CPU has special instructions like `XADD` (x86) or `LDADD` (ARM) that do the entire read-modify-write **atomically** — no thread can interrupt it.
+
+---
+
+## Memory Ordering
+
+When you use atomics, you specify a memory ordering:
+
+```rust
+// Relaxed = "I just need the counter to be correct eventually"
+metrics.received.fetch_add(1, Ordering::Relaxed);
+```
+
+| Ordering | Meaning | Use Case |
+|----------|---------|----------|
+| `Relaxed` | No ordering guarantees | Counters, metrics |
+| `Acquire` | See all writes before this | Reading flags |
+| `Release` | Make writes visible | Writing flags |
+| `SeqCst` | Full ordering | Complex synchronization |
+
+**For counters, `Relaxed` is perfect** — we don't care about order, just the final count.
+
+---
+
+## The Metrics Struct
+
+```rust
+struct Metrics {
+    received: AtomicU64,           // Total requests received
+    processed: AtomicU64,          // Successfully processed jobs
+    dropped: AtomicU64,            // Rejected due to backpressure
+    total_lock_wait_ns: AtomicU64, // For timing analysis
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            received: AtomicU64::new(0),
+            processed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            total_lock_wait_ns: AtomicU64::new(0),
+        }
+    }
+}
+```
+
+---
+
+## Where We Increment
+
+```rust
+// In connection handler (for every request):
+metrics.received.fetch_add(1, Ordering::Relaxed);
+
+// In worker (when job completes):
+metrics.processed.fetch_add(1, Ordering::Relaxed);
+
+// In connection handler (when queue is full):
+if tx.try_send(job).is_err() {
+    metrics.dropped.fetch_add(1, Ordering::Relaxed);
+}
+```
+
+---
+
+## The Metrics Endpoint
+
+Users can query metrics via JSON:
+
+**Request:**
+```json
+{"type":"metrics"}
+```
+
+**Response:**
+```json
+{
+  "received": 100000,
+  "processed": 99820,
+  "dropped": 180,
+  "pending": 0
+}
+```
+
+Code:
+```rust
+#[derive(Serialize)]
+struct MetricsResponse {
+    received: u64,
+    processed: u64,
+    dropped: u64,
+    pending: u64,  // received - processed - dropped
+}
+
+// In handler:
+if request.type == "metrics" {
+    let response = MetricsResponse {
+        received: metrics.received.load(Ordering::Relaxed),
+        processed: metrics.processed.load(Ordering::Relaxed),
+        dropped: metrics.dropped.load(Ordering::Relaxed),
+        pending: received - processed - dropped,
+    };
+    return serde_json::to_string(&response);
+}
+```
+
+---
+
+## Key Learnings
+
+### 1. Atomics are CPU-level operations
+- No OS involvement, no context switches
+- Way faster than Mutex (nanoseconds vs microseconds)
+- Hardware guarantees correctness
+
+### 2. Use Relaxed for simple counters
+- `Ordering::Relaxed` = fastest, no synchronization
+- Perfect for metrics that don't need ordering
+- Other orderings only needed for complex coordination
+
+### 3. Lock-free means no blocking
+- Threads never wait for each other
+- All threads make progress simultaneously
+- Essential for high-throughput systems
+
+### 4. Atomics can't do complex operations
+```rust
+// ✅ Works (single operation)
+counter.fetch_add(1, Ordering::Relaxed);
+
+// ❌ Doesn't work (multiple operations)
+let old = counter.load();
+counter.store(old * 2);  // RACE CONDITION!
+```
+
+For complex operations, still need Mutex or other synchronization.
+
+### 5. Metrics are critical for production
+- Can't optimize what you can't measure
+- Lock-free metrics = measuring without impacting performance
+- Essential for high-frequency paths
+
+---
+
+## Performance Comparison
+
+| Approach | Overhead per Increment | At 100k req/sec |
+|----------|------------------------|-----------------|
+| Mutex | ~1-5 μs | 100-500 ms/sec wasted |
+| AtomicU64 | ~10-50 ns | 1-5 ms/sec wasted |
+
+**Atomics are 100x faster** for simple counters!
+
+---
+
+## The Key Insight
+
+> **"Atomics exist for a reason."**
+
+When all you need is a simple counter, Mutex is overkill. The CPU has hardware support for lock-free operations — use it!
+
+---
+
+# STAGE 10 — Graceful Shutdown (PRODUCTION PAIN)
+
+## The Problem
+
+What happens when you press **Ctrl+C** on your server right now?
+
+```
+^C
+Process killed immediately
+```
+
+**What gets lost:**
+- Jobs currently being processed → **lost**
+- Jobs in the queue → **lost**
+- In-flight client responses → **never sent**
+
+In production, this is unacceptable. You need **graceful shutdown**.
+
+---
+
+## The Current Problem
+
+```
+                    Ctrl+C
+                      ↓
+[Main Loop] ──────────────────────────── KILLED
+    ↓
+[Accept] ─────────────────────────────── KILLED
+    ↓
+[Handler] → [Queue] → [Worker] ───────── KILLED (mid-job!)
+                         ↓
+                    Job lost forever
+```
+
+---
+
+## The Solution: Graceful Shutdown
+
+```
+                    Ctrl+C
+                      ↓
+[Shutdown Signal] ─→ broadcast to all components
+    ↓
+[Main Loop] → Stop accepting, but don't exit yet
+    ↓
+[Handlers] → Finish current requests, reject new
+    ↓  
+[Channel] → Close sender (no new jobs)
+    ↓
+[Workers] → Drain remaining jobs, then exit
+    ↓
+[All done] → Exit cleanly
+```
+
+---
+
+## Catching Ctrl+C in Tokio
+
+```rust
+use tokio::signal;
+use tokio::sync::broadcast;
+
+// Create shutdown broadcast channel
+let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+// Spawn Ctrl+C handler
+tokio::spawn(async move {
+    signal::ctrl_c().await.expect("Failed to listen");
+    println!("Shutdown signal received!");
+    let _ = shutdown_tx.send(());
+});
+```
+
+---
+
+## The Shutdown Flag Pattern
+
+```rust
+use std::sync::atomic::{AtomicBool, Ordering};
+
+let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+// In Ctrl+C handler:
+shutdown_flag.store(true, Ordering::Relaxed);
+
+// In workers:
+if shutdown_flag.load(Ordering::Relaxed) {
+    // Drain remaining jobs, then exit
+}
+```
+
+---
+
+## The Accept Loop with Shutdown
+
+```rust
+let mut shutdown_rx = shutdown_tx.subscribe();
+
+loop {
+    tokio::select! {
+        Ok((stream, addr)) = listener.accept() => {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                println!("Rejecting {} (shutting down)", addr);
+                continue;
+            }
+            // Handle connection...
+        }
+        _ = shutdown_rx.recv() => {
+            println!("Accept loop stopped");
+            break;
+        }
+    }
+}
+```
+
+---
+
+## The Worker Drain Pattern
+
+```rust
+loop {
+    if shutdown_flag.load(Ordering::Relaxed) {
+        // Drain mode: check for remaining jobs with timeout
+        let job = timeout(Duration::from_millis(100), rx.recv()).await;
+        
+        if job.is_err() || job.unwrap().is_none() {
+            println!("No more jobs, exiting");
+            break;
+        }
+        
+        // Process remaining job
+        process(job);
+    } else {
+        // Normal mode
+        if let Some(job) = rx.recv().await {
+            process(job);
+        } else {
+            break; // Channel closed
+        }
+    }
+}
+```
+
+---
+
+## The Shutdown Sequence
+
+```
+STARTUP ORDER:          SHUTDOWN ORDER:
+1. State                5. State (last)
+2. Channel              4. Channel (close sender)
+3. Workers              3. Workers (drain & exit)
+4. Accept loop          2. Accept loop (stop)
+5. Listen               1. Listen (stop)
+```
+
+**Rule:** Shutdown in **reverse order** of startup.
+
+---
+
+## Handling Timeouts
+
+```rust
+// Wait for workers with timeout
+let shutdown_timeout = Duration::from_secs(10);
+let start = Instant::now();
+
+for handle in worker_handles {
+    let remaining = shutdown_timeout.saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        println!("Timeout! Force exiting...");
+        break;
+    }
+    handle.join();
+}
+```
+
+---
+
+## The Final Metrics
+
+After shutdown, print what happened:
+
+```rust
+println!("📊 FINAL METRICS");
+println!("📊 Received:  {}", received);
+println!("📊 Processed: {}", processed);
+println!("📊 Dropped:   {}", dropped);
+println!("📊 Pending:   {} (lost on shutdown)", 
+    received - processed - dropped);
+```
+
+---
+
+## Why Shutdown Is Hard
+
+### Problem 1: Hanging Threads
+Workers blocking on `rx.recv()`. If main exits, workers never wake.
+
+**Solution:** Close the channel. `recv()` returns `None`, workers exit.
+
+### Problem 2: Lost Messages
+Jobs in queue when shutdown called → never processed.
+
+**Solution:** Drain the queue. Process remaining jobs before exit.
+
+### Problem 3: Deadlocks
+Workers waiting for something already shut down.
+
+**Solution:** Order matters. Shutdown in reverse order.
+
+### Problem 4: Infinite Hangs
+What if a worker never finishes?
+
+**Solution:** Timeout. Force exit after N seconds.
+
+---
+
+## Key Learnings
+
+### 1. Shutdown is harder than startup
+- Startup: ordered, predictable
+- Shutdown: concurrent, must coordinate
+
+### 2. Use signals, not just exit
+```rust
+// ❌ Bad: Just exits, loses everything
+std::process::exit(0);
+
+// ✅ Good: Graceful shutdown
+signal::ctrl_c().await;
+// ... cleanup ...
+```
+
+### 3. Broadcast for multi-component shutdown
+- One sender, multiple receivers
+- All components get the signal
+
+### 4. Drain before exit
+- Don't lose work in progress
+- Process remaining queue items
+
+### 5. Always have a timeout
+- Some code might hang forever
+- Set max shutdown time (e.g., 10 seconds)
+- Force exit if timeout exceeded
+
+---
+
+## The Key Insight
+
+> **"Shutdown is harder than startup."**
+
+When you start a server:
+- Things happen in order
+- Each component assumes previous ones exist
+
+When you shut down:
+- Everything runs simultaneously
+- Need to coordinate gracefully
+- Can't just kill — need to drain
+
+---
